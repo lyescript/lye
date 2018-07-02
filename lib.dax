@@ -1,0 +1,522 @@
+(define-global NULL nil)
+
+(define-global CHECK_STRING (x)
+  (unless (string? x)
+    (error (cat "Not a string: " (str x)))))
+
+(when-compiling
+  (define-macro enum (name rest: args)
+    (with expr `(do)
+      (for i (# args)
+        (let x (at args i)
+          (add expr `(define-global ,x ,i))))))
+  (define-macro eassert (condition)
+    `(unless ,condition
+       (error (cat "Assertion failed: " ,(escape (str condition))))))
+  (define-special %goto (name) tr: true
+    (cat (indentation) "continue " (compile name) ";\n"))
+  (define-macro goto args
+    `(%goto ,@args))
+  (define-special %label (name) tr: true
+    (cat (indentation) (compile name) ":\n"))
+  (define-macro label (name rest: body)
+    `(do (%label ,name)
+         (while true
+           ,@body
+           (break))))
+  nil)
+
+; /* Interned state of a symbol.  */
+
+(enum symbol_interned
+  SYMBOL_UNINTERNED
+  SYMBOL_INTERNED
+  SYMBOL_INTERNED_IN_INITIAL_OBARRAY)
+; enum symbol_interned
+; {
+;   SYMBOL_UNINTERNED = 0,
+;   SYMBOL_INTERNED = 1,
+;   SYMBOL_INTERNED_IN_INITIAL_OBARRAY = 2
+; };
+
+(enum symbol_redirect
+   SYMBOL_PLAINVAL
+   SYMBOL_VARALIAS
+   SYMBOL_LOCALIZED
+   SYMBOL_FORWARDED)
+; enum symbol_redirect
+; {
+;   SYMBOL_PLAINVAL  = 4,
+;   SYMBOL_VARALIAS  = 1,
+;   SYMBOL_LOCALIZED = 2,
+;   SYMBOL_FORWARDED = 3
+; };
+
+(enum symbol_trapped_write
+  SYMBOL_UNTRAPPED_WRITE
+  SYMBOL_NOWRITE
+  SYMBOL_TRAPPED_WRITE)
+; enum symbol_trapped_write
+; {
+;   SYMBOL_UNTRAPPED_WRITE = 0,
+;   SYMBOL_NOWRITE = 1,
+;   SYMBOL_TRAPPED_WRITE = 2
+; };
+
+(class Lisp_Symbol)
+; struct Lisp_Symbol
+; {
+;   union
+;   {
+;     struct
+;     {
+;       bool_bf gcmarkbit : 1;
+
+;       /* Indicates where the value can be found:
+;          0 : it's a plain var, the value is in the `value' field.
+;          1 : it's a varalias, the value is really in the `alias' symbol.
+;          2 : it's a localized var, the value is in the `blv' object.
+;          3 : it's a forwarding variable, the value is in `forward'.  */
+;       ENUM_BF (symbol_redirect) redirect : 3;
+
+;       /* 0 : normal case, just set the value
+;          1 : constant, cannot set, e.g. nil, t, :keywords.
+;          2 : trap the write, call watcher functions.  */
+;       ENUM_BF (symbol_trapped_write) trapped_write : 2;
+
+;       /* Interned state of the symbol.  This is an enumerator from
+;          enum symbol_interned.  */
+;       unsigned interned : 2;
+
+;       /* True means that this variable has been explicitly declared
+;          special (with `defvar' etc), and shouldn't be lexically bound.  */
+;       bool_bf declared_special : 1;
+
+;       /* True if pointed to from purespace and hence can't be GC'd.  */
+;       bool_bf pinned : 1;
+
+;       /* The symbol's name, as a Lisp string.  */
+;       Lisp_Object name;
+
+;       /* Value of the symbol or Qunbound if unbound.  Which alternative of the
+;          union is used depends on the `redirect' field above.  */
+;       union {
+;         Lisp_Object value;
+;         struct Lisp_Symbol *alias;
+;         struct Lisp_Buffer_Local_Value *blv;
+;         union Lisp_Fwd *fwd;
+;       } val;
+
+;       /* Function value of the symbol or Qnil if not fboundp.  */
+;       Lisp_Object function;
+
+;       /* The symbol's property list.  */
+;       Lisp_Object plist;
+
+;       /* Next symbol in obarray bucket, if the symbol is interned.  */
+;       struct Lisp_Symbol *next;
+;     } s;
+;     GCALIGNED_UNION
+;   } u;
+; };
+
+(define-global XSYMBOL (sym)
+  sym)
+
+;; alloc.c
+
+(define-global set-symbol-name (sym name)
+  (set (XSYMBOL sym .name) name))
+
+; static void
+; set_symbol_name (Lisp_Object sym, Lisp_Object name)
+; {
+;   XSYMBOL (sym)->u.s.name = name;
+; }
+
+(define-global set-symbol-plist (sym plist)
+  (set (XSYMBOL sym .plist) plist))
+
+(define-global set-symbol-function (sym func)
+  (set (XSYMBOL sym .function) func))
+
+(define-global set-symbol-next (sym p)
+  (set (XSYMBOL sym .next) p))
+
+(define-global SET_SYMBOL_VAL (sym v)
+  (eassert (= (sym .redirect) SYMBOL_PLAINVAL))
+  (set (sym .value) v))
+; #define lisp_h_SET_SYMBOL_VAL(sym, v) \
+;    (eassert ((sym)->u.s.redirect == SYMBOL_PLAINVAL), \
+;     (sym)->u.s.val.value = (v))
+
+(define-global init-symbol (val name)
+  (with p (XSYMBOL val)
+    (set-symbol-name val name)
+    (set-symbol-plist val Qnil)
+    (set (p .redirect) SYMBOL_PLAINVAL)
+    (SET_SYMBOL_VAL p Qunbound)
+    (set-symbol-function val Qnil)
+    (set-symbol-next val NULL)
+    (set (p .gcmarkbit) false)
+    (set (p .interned) SYMBOL_UNINTERNED)
+    (set (p .trapped-write) SYMBOL_UNTRAPPED_WRITE)
+    (set (p .declared-special) false)
+    (set (p .pinned) false)))
+; void
+; init_symbol (Lisp_Object val, Lisp_Object name)
+; {
+;   struct Lisp_Symbol *p = XSYMBOL (val);
+;   set_symbol_name (val, name);
+;   set_symbol_plist (val, Qnil);
+;   p->u.s.redirect = SYMBOL_PLAINVAL;
+;   SET_SYMBOL_VAL (p, Qunbound);
+;   set_symbol_function (val, Qnil);
+;   set_symbol_next (val, NULL);
+;   p->u.s.gcmarkbit = false;
+;   p->u.s.interned = SYMBOL_UNINTERNED;
+;   p->u.s.trapped_write = SYMBOL_UNTRAPPED_WRITE;
+;   p->u.s.declared_special = false;
+;   p->u.s.pinned = false;
+; }
+
+(define-global Fmake-symbol (name)
+  (CHECK_STRING name)
+  (with val (new Lisp_Symbol name)
+    (init-symbol val name)))
+; DEFUN ("make-symbol", Fmake_symbol, Smake_symbol, 1, 1, 0,
+;        doc: /* Return a newly allocated uninterned symbol whose name is NAME.
+; Its value is void, and its function definition and property list are nil.  */)
+;   (Lisp_Object name)
+; {
+;   Lisp_Object val;
+
+;   CHECK_STRING (name);
+
+;   MALLOC_BLOCK_INPUT;
+
+;   if (symbol_free_list)
+;     {
+;       XSETSYMBOL (val, symbol_free_list);
+;       symbol_free_list = symbol_free_list->u.s.next;
+;     }
+;   else
+;     {
+;       if (symbol_block_index == SYMBOL_BLOCK_SIZE)
+;         {
+;           struct symbol_block *new
+;             = lisp_malloc (sizeof *new, MEM_TYPE_SYMBOL);
+;           new->next = symbol_block;
+;           symbol_block = new;
+;           symbol_block_index = 0;
+;           total_free_symbols += SYMBOL_BLOCK_SIZE;
+;         }
+;       XSETSYMBOL (val, &symbol_block->symbols[symbol_block_index]);
+;       symbol_block_index++;
+;     }
+
+;   MALLOC_UNBLOCK_INPUT;
+
+;   init_symbol (val, name);
+;   consing_since_gc += sizeof (struct Lisp_Symbol);
+;   symbols_consed++;
+;   total_free_symbols--;
+;   return val;
+; }
+
+(define-global Qnil (new Lisp_Symbol))
+(define-global Qt (new Lisp_Symbol))
+(define-global Qunbound (new Lisp_Symbol))
+
+(init-symbol Qnil "nil")
+(init-symbol Qt "t")
+(init-symbol Qunbound "unbound")
+
+;; eval.c
+
+(define-global eval-sub (form)
+  (if (SYMBOLP form)
+      (do
+        (return (Fsymbol-value form)))
+    (error "Not implemented")))
+; /* Eval a sub-expression of the current expression (i.e. in the same
+;    lexical scope).  */
+; Lisp_Object
+; eval_sub (Lisp_Object form)
+; {
+;   Lisp_Object fun, val, original_fun, original_args;
+;   Lisp_Object funcar;
+;   ptrdiff_t count;
+
+;   /* Declare here, as this array may be accessed by call_debugger near
+;      the end of this function.  See Bug#21245.  */
+;   Lisp_Object argvals[8];
+
+;   if (SYMBOLP (form))
+;     {
+;       /* Look up its binding in the lexical environment.
+;          We do not pay attention to the declared_special flag here, since we
+;          already did that when let-binding the variable.  */
+;       Lisp_Object lex_binding
+;         = !NILP (Vinternal_interpreter_environment) /* Mere optimization!  */
+;         ? Fassq (form, Vinternal_interpreter_environment)
+;         : Qnil;
+;       if (CONSP (lex_binding))
+;         return XCDR (lex_binding);
+;       else
+;         return Fsymbol_value (form);
+;     }
+
+;   if (!CONSP (form))
+;     return form;
+
+;   maybe_quit ();
+
+;   maybe_gc ();
+
+;   if (++lisp_eval_depth > max_lisp_eval_depth)
+;     {
+;       if (max_lisp_eval_depth < 100)
+;         max_lisp_eval_depth = 100;
+;       if (lisp_eval_depth > max_lisp_eval_depth)
+;         error ("Lisp nesting exceeds `max-lisp-eval-depth'");
+;     }
+
+;   original_fun = XCAR (form);
+;   original_args = XCDR (form);
+;   CHECK_LIST (original_args);
+
+;   /* This also protects them from gc.  */
+;   count = record_in_backtrace (original_fun, &original_args, UNEVALLED);
+
+;   if (debug_on_next_call)
+;     do_debug_on_call (Qt, count);
+
+;   /* At this point, only original_fun and original_args
+;      have values that will be used below.  */
+;  retry:
+
+;   /* Optimize for no indirection.  */
+;   fun = original_fun;
+;   if (!SYMBOLP (fun))
+;     fun = Ffunction (Fcons (fun, Qnil));
+;   else if (!NILP (fun) && (fun = XSYMBOL (fun)->u.s.function, SYMBOLP (fun)))
+;     fun = indirect_function (fun);
+
+;   if (SUBRP (fun))
+;     {
+;       Lisp_Object args_left = original_args;
+;       Lisp_Object numargs = Flength (args_left);
+
+;       check_cons_list ();
+
+;       if (XINT (numargs) < XSUBR (fun)->min_args
+;           || (XSUBR (fun)->max_args >= 0
+;               && XSUBR (fun)->max_args < XINT (numargs)))
+;         xsignal2 (Qwrong_number_of_arguments, original_fun, numargs);
+
+;       else if (XSUBR (fun)->max_args == UNEVALLED)
+;         val = (XSUBR (fun)->function.aUNEVALLED) (args_left);
+;       else if (XSUBR (fun)->max_args == MANY)
+;         {
+;           /* Pass a vector of evaluated arguments.  */
+;           Lisp_Object *vals;
+;           ptrdiff_t argnum = 0;
+;           USE_SAFE_ALLOCA;
+
+;           SAFE_ALLOCA_LISP (vals, XINT (numargs));
+
+;           while (CONSP (args_left) && argnum < XINT (numargs))
+;             {
+;               Lisp_Object arg = XCAR (args_left);
+;               args_left = XCDR (args_left);
+;               vals[argnum++] = eval_sub (arg);
+;             }
+
+;           set_backtrace_args (specpdl + count, vals, argnum);
+
+;           val = XSUBR (fun)->function.aMANY (argnum, vals);
+
+;           check_cons_list ();
+;           lisp_eval_depth--;
+;           /* Do the debug-on-exit now, while VALS still exists.  */
+;           if (backtrace_debug_on_exit (specpdl + count))
+;             val = call_debugger (list2 (Qexit, val));
+;           SAFE_FREE ();
+;           specpdl_ptr--;
+;           return val;
+;         }
+;       else
+;         {
+;           int i, maxargs = XSUBR (fun)->max_args;
+
+;           for (i = 0; i < maxargs; i++)
+;             {
+;               argvals[i] = eval_sub (Fcar (args_left));
+;               args_left = Fcdr (args_left);
+;             }
+
+;           set_backtrace_args (specpdl + count, argvals, XINT (numargs));
+
+;           switch (i)
+;             {
+;             case 0:
+;               val = (XSUBR (fun)->function.a0 ());
+;               break;
+;             case 1:
+;               val = (XSUBR (fun)->function.a1 (argvals[0]));
+;               break;
+;             case 2:
+;               val = (XSUBR (fun)->function.a2 (argvals[0], argvals[1]));
+;               break;
+;             case 3:
+;               val = (XSUBR (fun)->function.a3
+;                      (argvals[0], argvals[1], argvals[2]));
+;               break;
+;             case 4:
+;               val = (XSUBR (fun)->function.a4
+;                      (argvals[0], argvals[1], argvals[2], argvals[3]));
+;               break;
+;             case 5:
+;               val = (XSUBR (fun)->function.a5
+;                      (argvals[0], argvals[1], argvals[2], argvals[3],
+;                       argvals[4]));
+;               break;
+;             case 6:
+;               val = (XSUBR (fun)->function.a6
+;                      (argvals[0], argvals[1], argvals[2], argvals[3],
+;                       argvals[4], argvals[5]));
+;               break;
+;             case 7:
+;               val = (XSUBR (fun)->function.a7
+;                      (argvals[0], argvals[1], argvals[2], argvals[3],
+;                       argvals[4], argvals[5], argvals[6]));
+;               break;
+
+;             case 8:
+;               val = (XSUBR (fun)->function.a8
+;                      (argvals[0], argvals[1], argvals[2], argvals[3],
+;                       argvals[4], argvals[5], argvals[6], argvals[7]));
+;               break;
+
+;             default:
+;               /* Someone has created a subr that takes more arguments than
+;                  is supported by this code.  We need to either rewrite the
+;                  subr to use a different argument protocol, or add more
+;                  cases to this switch.  */
+;               emacs_abort ();
+;             }
+;         }
+;     }
+;   else if (COMPILEDP (fun) || MODULE_FUNCTIONP (fun))
+;     return apply_lambda (fun, original_args, count);
+;   else
+;     {
+;       if (NILP (fun))
+;         xsignal1 (Qvoid_function, original_fun);
+;       if (!CONSP (fun))
+;         xsignal1 (Qinvalid_function, original_fun);
+;       funcar = XCAR (fun);
+;       if (!SYMBOLP (funcar))
+;         xsignal1 (Qinvalid_function, original_fun);
+;       if (EQ (funcar, Qautoload))
+;         {
+;           Fautoload_do_load (fun, original_fun, Qnil);
+;           goto retry;
+;         }
+;       if (EQ (funcar, Qmacro))
+;         {
+;           ptrdiff_t count1 = SPECPDL_INDEX ();
+;           Lisp_Object exp;
+;           /* Bind lexical-binding during expansion of the macro, so the
+;              macro can know reliably if the code it outputs will be
+;              interpreted using lexical-binding or not.  */
+;           specbind (Qlexical_binding,
+;                     NILP (Vinternal_interpreter_environment) ? Qnil : Qt);
+;           exp = apply1 (Fcdr (fun), original_args);
+;           unbind_to (count1, Qnil);
+;           val = eval_sub (exp);
+;         }
+;       else if (EQ (funcar, Qlambda)
+;                || EQ (funcar, Qclosure))
+;         return apply_lambda (fun, original_args, count);
+;       else
+;         xsignal1 (Qinvalid_function, original_fun);
+;     }
+;   check_cons_list ();
+
+;   lisp_eval_depth--;
+;   if (backtrace_debug_on_exit (specpdl + count))
+;     val = call_debugger (list2 (Qexit, val));
+;   specpdl_ptr--;
+
+;   return val;
+; }
+
+;; data.c
+
+(define-global find-symbol-value (symbol)
+  (CHECK_SYMBOL symbol)
+  (let sym (XSYMBOL symbol)
+    (label start
+      (case (sym .redirect)
+        (SYMBOL_VARALIAS
+          (set sym (indirect-variable sym))
+          (goto start))
+        (SYMBOL_PLAINVAL
+          (return (SYMBOL_VAL sym)))
+        (SYMBOL_LOCALIZED
+          (let blv (SYMBOL_BLV sym)
+            (swap-in-symval-forwarding sym blv)
+            (return (if (blv .fwd) (do-symval-forwarding (blv .fwd)) (blv-value blv)))))
+        (SYMBOL_FORWARDED
+          (return (do-symval-forwarding (SYMBOL_FWD sym))))
+        (else
+          (emacs-abort))))))
+
+; /* Find the value of a symbol, returning Qunbound if it's not bound.
+;    This is helpful for code which just wants to get a variable's value
+;    if it has one, without signaling an error.
+;    Note that it must not be possible to quit
+;    within this function.  Great care is required for this.  */
+
+; Lisp_Object
+; find_symbol_value (Lisp_Object symbol)
+; {
+;   struct Lisp_Symbol *sym;
+
+;   CHECK_SYMBOL (symbol);
+;   sym = XSYMBOL (symbol);
+
+;  start:
+;   switch (sym->u.s.redirect)
+;     {
+;     case SYMBOL_VARALIAS: sym = indirect_variable (sym); goto start;
+;     case SYMBOL_PLAINVAL: return SYMBOL_VAL (sym);
+;     case SYMBOL_LOCALIZED:
+;       {
+;         struct Lisp_Buffer_Local_Value *blv = SYMBOL_BLV (sym);
+;         swap_in_symval_forwarding (sym, blv);
+;         return blv->fwd ? do_symval_forwarding (blv->fwd) : blv_value (blv);
+;       }
+;     case SYMBOL_FORWARDED:
+;       return do_symval_forwarding (SYMBOL_FWD (sym));
+;     default: emacs_abort ();
+;     }
+; }
+
+; DEFUN ("symbol-value", Fsymbol_value, Ssymbol_value, 1, 1, 0,
+;        doc: /* Return SYMBOL's value.  Error if that is void.
+; Note that if `lexical-binding' is in effect, this returns the
+; global value outside of any lexical scope.  */)
+;   (Lisp_Object symbol)
+; {
+;   Lisp_Object val;
+
+;   val = find_symbol_value (symbol);
+;   if (!EQ (val, Qunbound))
+;     return val;
+
+;   xsignal1 (Qvoid_variable, symbol);
+; }
+

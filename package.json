@@ -4,7 +4,8 @@
   "description": "An extensible Lisp for JavaScript",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "dax lib.dax",
+    "test": "dax lib.dax"
   },
   "repository": {
     "type": "git",
@@ -15,5 +16,8 @@
   "bugs": {
     "url": "https://github.com/lyescript/lye/issues"
   },
-  "homepage": "https://github.com/lyescript/lye#readme"
+  "homepage": "https://github.com/lyescript/lye#readme",
+  "dependencies": {
+    "dax": "^0.1.16"
+  }
 }
