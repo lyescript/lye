@@ -1,6 +1,6 @@
 {
   "name": "lye",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "An extensible Lisp for JavaScript",
   "main": "index.js",
   "scripts": {
